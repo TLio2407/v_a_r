@@ -19,14 +19,25 @@ def read_next_bytes(fid, num_bytes: int) -> bytes:
 
 def read_cameras(path: Path) -> Dict[int, Dict]:
     """Read COLMAP cameras.bin file."""
+    # Standard COLMAP models and their respective parameter counts
+    CAMERA_NUM_PARAMS = {
+        0: 3, 1: 4, 2: 4, 3: 5, 4: 8, 5: 8, 6: 9, 7: 8, 8: 3, 9: 4, 10: 12, 11: 2
+    }
+    
     cameras = {}
     with open(path, "rb") as fid:
         num_cameras = struct.unpack("Q", read_next_bytes(fid, 8))[0]
         for _ in range(num_cameras):
+            # Read all 24 bytes for standard properties
             camera_properties = read_next_bytes(fid, 24)
-            camera_id, model_id, width, height = struct.unpack("IIQ", camera_properties[:16])
-            params_size = struct.unpack("Q", camera_properties[16:24])[0]
-            params = np.fromfile(fid, np.float64, params_size)
+            
+            # Correctly unpack 4 variables: 2 ints (4 bytes) and 2 unsigned long longs (8 bytes) = 24 bytes
+            camera_id, model_id, width, height = struct.unpack("IIQQ", camera_properties)
+            
+            # Look up the correct parameter size based on the model ID
+            num_params = CAMERA_NUM_PARAMS.get(model_id, 4)
+            params = np.fromfile(fid, np.float64, num_params)
+            
             cameras[camera_id] = {
                 "model_id": model_id,
                 "width": width,
@@ -40,20 +51,27 @@ def read_images(path: Path) -> Dict[int, Dict]:
     """Read COLMAP images.bin file."""
     images = {}
     with open(path, "rb") as fid:
-        num_images = struct.unpack("Q", read_next_bytes(fid, 8))[0]
+        num_images = struct.unpack("<Q", read_next_bytes(fid, 8))[0]
         for _ in range(num_images):
+            # Read exactly 64 bytes: image_id (4), qvec (4*8), tvec (3*8), camera_id (4)
+            # Use '<' for standard little-endian unpacking without padding
             binary_image_properties = read_next_bytes(fid, 64)
-            image_id, qvec_0, qvec_1, qvec_2, qvec_3, tvec_0, tvec_1, tvec_2 = struct.unpack(
-                "Qddddddd", binary_image_properties
+            image_id, qvec_0, qvec_1, qvec_2, qvec_3, tvec_0, tvec_1, tvec_2, camera_id = struct.unpack(
+                "<idddddddi", binary_image_properties
             )
             qvec = np.array([qvec_0, qvec_1, qvec_2, qvec_3])
             tvec = np.array([tvec_0, tvec_1, tvec_2])
 
-            camera_id = struct.unpack("I", read_next_bytes(fid, 4))[0]
-            image_name_len = struct.unpack("Q", read_next_bytes(fid, 8))[0]
-            image_name = read_next_bytes(fid, image_name_len).decode("utf-8")
+            # Image names in COLMAP are null-terminated strings (\x00)
+            image_name_bytes = b""
+            while True:
+                char = read_next_bytes(fid, 1)
+                if char == b"\x00" or not char:
+                    break
+                image_name_bytes += char
+            image_name = image_name_bytes.decode("utf-8")
 
-            num_points2d = struct.unpack("Q", read_next_bytes(fid, 8))[0]
+            num_points2d = struct.unpack("<Q", read_next_bytes(fid, 8))[0]
             xys = np.fromfile(fid, np.float64, 2 * num_points2d).reshape(-1, 2) if num_points2d > 0 else np.array([])
             point3d_ids = np.fromfile(fid, np.int64, num_points2d) if num_points2d > 0 else np.array([])
 
@@ -67,29 +85,26 @@ def read_images(path: Path) -> Dict[int, Dict]:
             }
     return images
 
-
 def read_points3d(path: Path) -> Dict[int, Dict]:
     """Read COLMAP points3D.bin file."""
     points3d = {}
     with open(path, "rb") as fid:
-        num_points = struct.unpack("Q", read_next_bytes(fid, 8))[0]
+        # Use '<' to strictly enforce little-endian standard sizing without padding
+        num_points = struct.unpack("<Q", read_next_bytes(fid, 8))[0]
         for _ in range(num_points):
-            binary_point_line_properties = read_next_bytes(fid, 43)
+            # Read exactly 51 bytes: Q(8) + d(8)*3 + B(1)*3 + d(8) + Q(8)
+            binary_point_line_properties = read_next_bytes(fid, 51)
             point3d_id, x, y, z, r, g, b, error, track_length = struct.unpack(
-                "Qfffcccfd", binary_point_line_properties
+                "<QdddBBBdQ", binary_point_line_properties
             )
-            track_length = int(track_length)
             
             # Read track elements (image_id, point2d_idx pairs)
             image_ids = np.fromfile(fid, np.uint32, track_length)
             point2d_idxs = np.fromfile(fid, np.uint32, track_length)
 
             xyz = np.array([x, y, z], dtype=np.float32)
-            rgb = np.array([
-                int.from_bytes(r, "little") if isinstance(r, bytes) else ord(r),
-                int.from_bytes(g, "little") if isinstance(g, bytes) else ord(g),
-                int.from_bytes(b, "little") if isinstance(b, bytes) else ord(b),
-            ])
+            # The 'B' format already unpacks to standard Python integers
+            rgb = np.array([r, g, b], dtype=np.uint8)
             
             points3d[point3d_id] = {
                 "xyz": xyz,
@@ -99,8 +114,6 @@ def read_points3d(path: Path) -> Dict[int, Dict]:
                 "point2d_idxs": point2d_idxs,
             }
     return points3d
-
-
 def qvec2rotmat(qvec: np.ndarray) -> np.ndarray:
     """Convert quaternion (w, x, y, z) to 3x3 rotation matrix."""
     w, x, y, z = qvec

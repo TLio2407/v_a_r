@@ -48,18 +48,25 @@ class SceneDataset:
 
         # Load COLMAP data
         sparse_dir = self.train_dir / "sparse" / "0"
+        cameras_file = sparse_dir / "cameras.bin"
+        print(f"Looking for camera in: {cameras_file}")
+        images_file = sparse_dir / "images.bin"
+        print(f"Looking for images in: {images_file}")
+        points3d_file = sparse_dir / "points3D.bin"
+        print(f"Looking for points3D in: {points3d_file}")
+        
         if sparse_dir.exists():
             try:
-                cameras_file = sparse_dir / "cameras.bin"
-                images_file = sparse_dir / "images.bin"
-                points3d_file = sparse_dir / "points3D.bin"
-                
+                if points3d_file.exists():
+                    print(f"Found COLMAP points3D file: {points3d_file}")
+                    self.colmap_points3d = read_points3d(points3d_file)
                 if cameras_file.exists():
+                    print(f"Found COLMAP cameras file: {cameras_file}")
                     self.colmap_cameras = read_cameras(cameras_file)
                 if images_file.exists():
+                    print(f"Found COLMAP images file: {images_file}")
                     self.colmap_images = read_images(images_file)
-                if points3d_file.exists():
-                    self.colmap_points3d = read_points3d(points3d_file)
+
             except Exception as e:
                 import warnings
                 warnings.warn(f"Failed to load COLMAP data: {e}. Continuing without COLMAP pose information.")
@@ -74,6 +81,9 @@ class SceneDataset:
 
     def get_all_training_images(self) -> List[np.ndarray]:
         """Load all training images."""
+        # Force synchronization to ensure 1:1 mapping before loading
+        self.get_training_camera_poses()
+        
         images = []
         for i in range(len(self.train_images)):
             img, _ = self.get_training_image(i)
@@ -82,30 +92,58 @@ class SceneDataset:
 
     def get_training_camera_poses(self) -> List[Camera]:
         """Extract camera poses from COLMAP data for training images."""
+        # Return cached cameras if we've already synced
+        if hasattr(self, '_synced_cameras'):
+            return self._synced_cameras
+            
+        # If COLMAP failed to load, return empty list and preserve train_images for blind fallback
+        if not self.colmap_images:
+            self._synced_cameras = []
+            return []
+            
         cameras = []
-        for img_id in sorted(self.colmap_images.keys()):
-            img_data = self.colmap_images[img_id]
-            camera_id = img_data["camera_id"]
-            if camera_id not in self.colmap_cameras:
-                continue
-            
-            cam_data = self.colmap_cameras[camera_id]
-            qvec = img_data["qvec"]
-            tvec = img_data["tvec"]
-            
-            # Extract intrinsics from COLMAP camera params
-            params = cam_data["params"]
-            fx = fy = params[0]  # Assuming pinhole model with equal focal lengths
-            cx, cy = params[1], params[2]
-            width, height = cam_data["width"], cam_data["height"]
-            
-            intrinsics = CameraIntrinsics(fx, fy, cx, cy, width, height)
-            pose = CameraPose(qvec, tvec)
-            camera = Camera(intrinsics, pose)
-            cameras.append(camera)
+        valid_train_images = []
+        
+        # Create a lookup dictionary mapping filename to COLMAP image data
+        colmap_lookup = {Path(data["name"]).name: data for data in self.colmap_images.values()}
+        
+        # Iterate over train_images to guarantee exact 1:1 ordering
+        for img_path in self.train_images:
+            img_name = img_path.name
+            if img_name in colmap_lookup:
+                img_data = colmap_lookup[img_name]
+                camera_id = img_data["camera_id"]
+                if camera_id not in self.colmap_cameras:
+                    continue
+                
+                cam_data = self.colmap_cameras[camera_id]
+                qvec = img_data["qvec"]
+                tvec = img_data["tvec"]
+                
+                # Extract intrinsics from COLMAP camera params
+                params = cam_data["params"]
+                model_id = cam_data.get("model_id", 0)
+                
+                if model_id == 1 or len(params) == 4:
+                    # PINHOLE (model 1)
+                    fx, fy, cx, cy = params[0], params[1], params[2], params[3]
+                else:
+                    # SIMPLE_PINHOLE (model 0)
+                    fx = fy = params[0]
+                    cx, cy = params[1], params[2]
+                width, height = cam_data["width"], cam_data["height"]
+                
+                intrinsics = CameraIntrinsics(fx, fy, cx, cy, width, height)
+                pose = CameraPose(qvec, tvec)
+                cameras.append(Camera(intrinsics, pose))
+                valid_train_images.append(img_path)
+        
+        # Update train_images to drop any frames missing from COLMAP
+        self.train_images = valid_train_images
+        self._synced_cameras = cameras
         
         return cameras
-
+    
     def get_test_cameras(self) -> List[Camera]:
         """Get camera parameters for test views."""
         return self.test_cameras
@@ -226,19 +264,17 @@ class SceneDataset:
 def discover_all_scenes(base_dir: Path) -> List[SceneDataset]:
     """Discover all scenes in the dataset."""
     scenes = []
-    for collection_dir in sorted(base_dir.iterdir()):
-        if not collection_dir.is_dir():
+    
+    for scene_dir in sorted(base_dir.iterdir()):
+        if not scene_dir.is_dir():
             continue
-        for scene_dir in sorted(collection_dir.iterdir()):
-            if not scene_dir.is_dir():
-                continue
-            train_images_dir = scene_dir / "train" / "images"
-            test_poses_path = scene_dir / "test" / "test_poses.csv"
-            if train_images_dir.exists() and test_poses_path.exists():
-                try:
-                    dataset = SceneDataset(scene_dir)
-                    scenes.append(dataset)
-                except Exception as e:
-                    print(f"Failed to load scene {scene_dir}: {e}")
+        train_images_dir = scene_dir / "train" / "images"
+        test_poses_path = scene_dir / "test" / "test_poses.csv"
+        if train_images_dir.exists() and test_poses_path.exists():
+            try:
+                dataset = SceneDataset(scene_dir)
+                scenes.append(dataset)
+            except Exception as e:
+                print(f"Failed to load scene {scene_dir}: {e}")
     
     return scenes

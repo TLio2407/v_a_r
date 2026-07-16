@@ -5,7 +5,7 @@ from pathlib import Path
 
 # 1. Configuration
 # Replace this with your NEW personal file ID from your Google Drive copy
-NEW_FILE_ID = '1QwL4uj6MoyvfuWUSc5a4ofsOg2v4PFsO'  
+NEW_FILE_ID = '1b9F4B1tDVX8bIX4fZxsP9bduRynDUN_a'  
 URL = f'https://drive.google.com/uc?id={NEW_FILE_ID}'
 
 # Define paths
